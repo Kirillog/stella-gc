@@ -17,6 +17,18 @@
         nativeBuildInputs = [ pkgs.cmake ];
       };
 
+      # `nix flake check` (or `nix build .#checks.x86_64-linux.default -L`)
+      # builds the collector and runs the CTest suite in the sandbox.
+      checks.${system}.default = self.packages.${system}.default.overrideAttrs (old: {
+        pname = "stella-gc-tests";
+        doCheck = true;
+        checkPhase = ''
+          runHook preCheck
+          ctest --output-on-failure
+          runHook postCheck
+        '';
+      });
+
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [ cmake gcc gdb valgrind ];
       };

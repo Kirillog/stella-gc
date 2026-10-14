@@ -21,11 +21,12 @@ else()
   set(GC_SOURCE gc.c)
 endif()
 
+# Collector + runtime without the program entry point (runtime/main.c), so that
+# C tests calling gc.h directly can provide their own main().
 add_library(stella_gc STATIC
   ${GC_SOURCE}
   runtime/runtime.c
   runtime/scalar.c
-  runtime/main.c
 )
 target_include_directories(stella_gc PUBLIC include ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -33,8 +34,11 @@ target_include_directories(stella_gc PUBLIC include ${CMAKE_CURRENT_SOURCE_DIR})
 file(GLOB EXAMPLES CONFIGURE_DEPENDS examples/*.c)
 foreach(example ${EXAMPLES})
   get_filename_component(name ${example} NAME_WE)
-  add_executable(${name} ${example})
+  add_executable(${name} ${example} runtime/main.c)
   target_link_libraries(${name} PRIVATE stella_gc)
   set_target_properties(${name} PROPERTIES LINKER_LANGUAGE CXX)
   install(TARGETS ${name})
 endforeach()
+
+enable_testing()
+add_subdirectory(tests)
