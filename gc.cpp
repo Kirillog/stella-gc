@@ -1,5 +1,8 @@
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <format>
+#include <exception>
 #include <list>
 #include <memory>
 #include <new>
@@ -43,7 +46,9 @@ static StellaGcStats counters;
 #define GC_DESCRIPTION "malloc stub"
 #endif
 
+#ifndef GC_SCAN_COUNT
 #define GC_SCAN_COUNT 10
+#endif
 #define GC_SCAN_FULL UINT32_MAX
 
 struct Heap {
@@ -64,15 +69,38 @@ struct Heap {
     struct SemiSpace {
         uint8_t *base, *end;
         uint8_t* ptr;
+        uint8_t* top;
+
+        size_t free_bytes() const {
+            return static_cast<size_t>(top - ptr);
+        }
+        size_t used_bytes() const {
+            return static_cast<size_t>(ptr - base) + static_cast<size_t>(end - top);
+        }
+
+        void reset() {
+            ptr = base;
+            top = end - (static_cast<size_t>(end - base) % alignof(max_align_t));
+        }
 
         uint8_t* allocate(size_t size) {
-            size_t aligned = aligned_size(size); 
-            ptr += aligned;
-            if (ptr > end) {
+            size_t aligned = aligned_size(size);
+            if (aligned > free_bytes()) {
                 ++counters.failed_allocations;
                 stella_gc_out_of_memory(size);
             }
+            ptr += aligned;
             return ptr - aligned;
+        }
+
+        uint8_t* allocate_end(size_t size) {
+            size_t aligned = aligned_size(size);
+            if (aligned > free_bytes()) {
+                ++counters.failed_allocations;
+                stella_gc_out_of_memory(size);
+            }
+            top -= aligned;
+            return top;
         }
 
         bool contains(StellaObject* obj) const {
@@ -84,7 +112,7 @@ struct Heap {
     uint8_t* arena1, *arena2;
     SemiSpace from_space;
     SemiSpace to_space;
-    uint8_t* scan, *limit;
+    uint8_t* scan;
     bool collecting;
     size_t max_heap_bytes;
 
@@ -95,14 +123,11 @@ struct Heap {
     explicit Heap(size_t max_heap_bytes) : max_heap_bytes(max_heap_bytes), allocations(), dynamic_roots(), permanent_roots() {
         arena1 = new uint8_t[max_heap_bytes];
         arena2 = new uint8_t[max_heap_bytes];
-        from_space = {arena1,
-                      arena1 + max_heap_bytes,
-                      arena1};
-        to_space   = {arena2,
-                      arena2 + max_heap_bytes,
-                      arena2};
+        from_space = {arena1, arena1 + max_heap_bytes, arena1, arena1};
+        to_space   = {arena2, arena2 + max_heap_bytes, arena2, arena2};
+        from_space.reset();
+        to_space.reset();
         scan = to_space.base;
-        limit = to_space.end;
         collecting = false;
     }
 
@@ -253,7 +278,7 @@ struct Heap {
         }
         size_t requested = object_size(descriptor);
         size_t rounded = aligned_size(requested);
-        if (rounded > static_cast<size_t>(from_space.end - from_space.ptr) || collecting) {
+        if (rounded > from_space.free_bytes() || collecting) {
             step_collect();
         }
         GC_BEFORE_ALLOC(requested);
@@ -264,7 +289,7 @@ struct Heap {
 
         StellaValue object;
         if (collecting) {
-            if (limit - rounded < to_space.ptr) {
+            if (rounded > to_space.free_bytes()) {
                 full_collect();
                 if (requested > max_heap_bytes - counters.occupied_bytes) {
                     ++counters.failed_allocations;
@@ -272,7 +297,7 @@ struct Heap {
                 }
                 object = reinterpret_cast<StellaValue>(from_space.allocate(requested));
             } else {
-                object = reinterpret_cast<StellaValue>(to_space.allocate(requested));
+                object = reinterpret_cast<StellaValue>(to_space.allocate_end(requested));
             }
         } else {
             object = reinterpret_cast<StellaValue>(from_space.allocate(requested));
@@ -326,12 +351,16 @@ struct Heap {
         if (obj->descriptor->slot_capacity) {
             q->fields = (StellaSlot *)(q + 1);
         }
-        // the allocation entry follows the object to its new address
-        auto node = allocation_index.extract(obj);
-        if (!node.empty()) {
-            node.key() = q;
-            node.mapped()->object = q;
-            allocation_index.insert(std::move(node));
+        try {
+            // the allocation entry follows the object to its new address
+            auto node = allocation_index.extract(obj);
+            if (!node.empty()) {
+                node.key() = q;
+                node.mapped()->object = q;
+                allocation_index.insert(std::move(node));
+            }
+        } catch (std::exception & exc) {
+            stella_abi_violation(std::format("allocation node failed with {}", exc.what()).c_str());
         }
         obj->gc_word = reinterpret_cast<uintptr_t>(q);
         return q;
@@ -340,7 +369,6 @@ struct Heap {
     void start_cycle() {
         collecting = true;
         scan = to_space.base;
-        limit = to_space.end;
         counters.occupied_bytes = 0;
         for (auto& perm_root : permanent_roots) {
             *perm_root = forward(*perm_root);
@@ -361,8 +389,8 @@ struct Heap {
         }
         collecting = false;
         std::swap(from_space, to_space);
-        to_space.ptr = to_space.base;
-        ++counters.collections;
+        to_space.reset();
+        ++counters.completed_collection_cycles;
     }
 
     void scan_one() {
@@ -372,6 +400,7 @@ struct Heap {
         }
         obj->gc_word = 0;
         scan += aligned_size(object_size(obj->descriptor));
+        ++counters.collection_step_count;
     }
 
     void collect(uint32_t step_count) {
@@ -391,6 +420,7 @@ struct Heap {
     }
 
     inline void full_collect() {
+        ++counters.force_full_cycles;
         collect(GC_SCAN_FULL);
     }
 
@@ -645,7 +675,9 @@ void stella_gc_print_statistics(FILE *output) {
   fprintf(output, "requested bytes: %zu\n", counters.requested_bytes);
   fprintf(output, "rounded bytes: %zu\n", counters.rounded_bytes);
   fprintf(output, "allocated objects: %zu\n", counters.allocated_objects);
-  fprintf(output, "collections: %zu\n", counters.collections);
+  fprintf(output, "collection completed cycles: %zu\n", counters.completed_collection_cycles);
+  fprintf(output, "collection step count: %zu\n", counters.collection_step_count);
+  fprintf(output, "collection force cycles: %zu\n", counters.force_full_cycles);
   fprintf(output, "occupied bytes: %zu\n", counters.occupied_bytes);
   fprintf(
       output,
@@ -713,7 +745,7 @@ void stella_gc_print_state(FILE *output) {
     fprintf(
         output,
         "allocation=[%p,%p) object=%p descriptor=%s kind=%" PRIu32
-        " managed=%zu primitive=%zu capacity=%zu gc_word=%" PRIuPTR "\n",
+        " managed=%zu primitive=%zu capacity=%zu gc_word=%" PRIuPTR " grey=%d\n",
         (void *)object,
         (void *)((unsigned char *)object + allocation.rounded_bytes),
         (void *)object,
@@ -722,7 +754,8 @@ void stella_gc_print_state(FILE *output) {
         descriptor->managed_count,
         descriptor->primitive_count,
         descriptor->slot_capacity,
-        object->gc_word);
+        object->gc_word,
+        heap->to_space.contains(object) && heap->scan <= reinterpret_cast<uint8_t*>(object) && reinterpret_cast<uint8_t*>(object) < heap->to_space.top);
     for (size_t i = 0; i < descriptor->managed_count; ++i) {
       fprintf(
           output,
@@ -738,6 +771,16 @@ void stella_gc_print_state(FILE *output) {
           object->fields[descriptor->managed_count + i].primitive);
     }
   }
+  fprintf(output, "from_space: base=%p, end=%p, used=%zu, free=%zu", 
+    heap.get()->from_space.base, heap.get()->from_space.end, heap.get()->from_space.used_bytes(), heap.get()->from_space.free_bytes());
+  fprintf(output, "to_space: base=%p, end=%p, used=%zu, free=%zu", 
+    heap.get()->to_space.base, heap.get()->to_space.end, heap.get()->to_space.used_bytes(), heap.get()->to_space.free_bytes());
+  fprintf(output, "scan=%p\n", heap.get()->scan);
+  fprintf(output, "next=%p\n", heap.get()->to_space.ptr);
+  fprintf(output, "limit=%p\n", heap.get()->to_space.top);
+  fprintf(output, "collecting=%d\n", heap.get()->collecting);
+
+
   stella_gc_print_roots(output);
 }
 
