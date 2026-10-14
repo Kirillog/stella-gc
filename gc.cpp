@@ -5,6 +5,7 @@
 #include <new>
 #include <cinttypes>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 #define _Noreturn [[noreturn]]
@@ -42,6 +43,9 @@ static StellaGcStats counters;
 #define GC_DESCRIPTION "malloc stub"
 #endif
 
+#define GC_SCAN_COUNT 10
+#define GC_SCAN_FULL UINT32_MAX
+
 struct Heap {
 
     struct Allocation {
@@ -58,7 +62,7 @@ struct Heap {
     };
 
     struct SemiSpace {
-        uint8_t *begin, *end;
+        uint8_t *base, *end;
         uint8_t* ptr;
 
         uint8_t* allocate(size_t size) {
@@ -72,7 +76,7 @@ struct Heap {
         }
 
         bool contains(StellaObject* obj) const {
-            return reinterpret_cast<uint8_t*>(obj) >= begin &&
+            return reinterpret_cast<uint8_t*>(obj) >= base &&
                     reinterpret_cast<uint8_t*>(obj) < end;
         }
     };
@@ -80,9 +84,12 @@ struct Heap {
     uint8_t* arena1, *arena2;
     SemiSpace from_space;
     SemiSpace to_space;
+    uint8_t* scan, *limit;
+    bool collecting;
     size_t max_heap_bytes;
 
     std::list<Allocation> allocations;
+    std::unordered_map<StellaValue, std::list<Allocation>::iterator> allocation_index;
     std::vector<StellaValue*> dynamic_roots, permanent_roots;
 
     explicit Heap(size_t max_heap_bytes) : max_heap_bytes(max_heap_bytes), allocations(), dynamic_roots(), permanent_roots() {
@@ -94,6 +101,9 @@ struct Heap {
         to_space   = {arena2,
                       arena2 + max_heap_bytes,
                       arena2};
+        scan = to_space.base;
+        limit = to_space.end;
+        collecting = false;
     }
 
     static bool add_overflows(size_t left, size_t right) {
@@ -179,12 +189,8 @@ struct Heap {
     }
 
     Allocation *find_allocation(StellaValue object) {
-        for (auto& allocation : allocations) {
-            if (allocation.object == object) {
-                return &allocation;
-            }
-        }
-        return NULL;
+        auto it = allocation_index.find(object);
+        return it == allocation_index.end() ? NULL : &*it->second;
     }
 
     Allocation *require_heap_object(StellaValue object) {
@@ -247,8 +253,8 @@ struct Heap {
         }
         size_t requested = object_size(descriptor);
         size_t rounded = aligned_size(requested);
-        if (rounded > static_cast<size_t>(from_space.end - from_space.ptr)) {
-            collect();
+        if (rounded > static_cast<size_t>(from_space.end - from_space.ptr) || collecting) {
+            step_collect();
         }
         GC_BEFORE_ALLOC(requested);
         if (requested > max_heap_bytes - counters.occupied_bytes) {
@@ -256,7 +262,21 @@ struct Heap {
             stella_gc_out_of_memory(requested);
         }
 
-        StellaValue object = reinterpret_cast<StellaValue>(from_space.allocate(requested));
+        StellaValue object;
+        if (collecting) {
+            if (limit - rounded < to_space.ptr) {
+                full_collect();
+                if (requested > max_heap_bytes - counters.occupied_bytes) {
+                    ++counters.failed_allocations;
+                    stella_gc_out_of_memory(requested);
+                }
+                object = reinterpret_cast<StellaValue>(from_space.allocate(requested));
+            } else {
+                object = reinterpret_cast<StellaValue>(to_space.allocate(requested));
+            }
+        } else {
+            object = reinterpret_cast<StellaValue>(from_space.allocate(requested));
+        }
 
         object->descriptor = descriptor;
         object->gc_word = 0;
@@ -274,6 +294,7 @@ struct Heap {
 
         try {
             allocations.emplace_front(object, requested, rounded, descriptor->slot_capacity);
+            allocation_index.emplace(object, allocations.begin());
             GC_ALLOCATION_INIT(&allocations.front());
         } catch (std::bad_alloc &exc){
             ++counters.failed_allocations;
@@ -290,57 +311,97 @@ struct Heap {
         return object;
     }
 
+    StellaValue forward(StellaValue obj) {
+        if (!from_space.contains(obj)) {
+            return obj;
+        }
+        if (obj->gc_word) {
+            return reinterpret_cast<StellaValue>(obj->gc_word);
+        }
+        size_t n = object_size(obj->descriptor);
+        counters.occupied_bytes += n;
+        StellaValue q = reinterpret_cast<StellaValue>(to_space.allocate(n));
+        std::memcpy(q, obj, n);
+        // fix fields pointer to point to-space
+        if (obj->descriptor->slot_capacity) {
+            q->fields = (StellaSlot *)(q + 1);
+        }
+        // the allocation entry follows the object to its new address
+        auto node = allocation_index.extract(obj);
+        if (!node.empty()) {
+            node.key() = q;
+            node.mapped()->object = q;
+            allocation_index.insert(std::move(node));
+        }
+        obj->gc_word = reinterpret_cast<uintptr_t>(q);
+        return q;
+    }
 
-    void collect() {
-        uint8_t* scan = to_space.begin;
+    void start_cycle() {
+        collecting = true;
+        scan = to_space.base;
+        limit = to_space.end;
         counters.occupied_bytes = 0;
-
-        auto forward = [&](StellaValue obj) -> StellaValue {
-            if (!from_space.contains(obj)) {
-                return obj;
-            }
-            if (obj->gc_word) {
-                return reinterpret_cast<StellaValue>(obj->gc_word);
-            }
-            size_t n = object_size(obj->descriptor);
-            counters.occupied_bytes += n;
-            StellaValue q = reinterpret_cast<StellaValue>(to_space.allocate(n));
-            std::memcpy(q, obj, n);
-            // fix fields pointer to point to-space
-            if (obj->descriptor->slot_capacity) {
-                q->fields = (StellaSlot *)(q + 1);
-            }
-            obj->gc_word = reinterpret_cast<uintptr_t>(q);
-            return q;
-        };
-
         for (auto& perm_root : permanent_roots) {
             *perm_root = forward(*perm_root);
         }
         for (auto& dyn_root: dynamic_roots) {
             *dyn_root = forward(*dyn_root);
         }
-        while (scan < to_space.ptr) {
-            StellaValue obj = reinterpret_cast<StellaValue>(scan);
-            for (size_t i = 0; i < obj->descriptor->managed_count; ++i) {
-                obj->fields[i].managed = forward(obj->fields[i].managed);
-            }
-            obj->gc_word = 0;
-            scan += aligned_size(object_size(obj->descriptor));
-        }
-        // sweep stale entries and pointers to from-space
+    }
+
+    void finish_cycle() {
         for (auto it = allocations.begin(); it != allocations.end();) {
-            auto next_it = std::next(it); 
-            if (!it->object->gc_word) {
-                allocations.erase(it);
+            if (from_space.contains(it->object)) {
+                allocation_index.erase(it->object);
+                it = allocations.erase(it);
             } else {
-                it->object = forward(it->object);
+                ++it;
             }
-            it = next_it;
         }
+        collecting = false;
         std::swap(from_space, to_space);
-        to_space.ptr = to_space.begin;
+        to_space.ptr = to_space.base;
         ++counters.collections;
+    }
+
+    void scan_one() {
+        StellaValue obj = reinterpret_cast<StellaValue>(scan);
+        for (size_t i = 0; i < obj->descriptor->managed_count; ++i) {
+            obj->fields[i].managed = forward(obj->fields[i].managed);
+        }
+        obj->gc_word = 0;
+        scan += aligned_size(object_size(obj->descriptor));
+    }
+
+    void collect(uint32_t step_count) {
+        if (!collecting) {
+            start_cycle();
+        }
+        while (scan < to_space.ptr && step_count-- > 0) {
+            scan_one();
+        }
+        if (scan >= to_space.ptr) {
+            finish_cycle();
+        }
+    }
+
+    inline void step_collect() {
+        collect(GC_SCAN_COUNT);
+    }
+
+    inline void full_collect() {
+        collect(GC_SCAN_FULL);
+    }
+
+    StellaValue read(StellaValue *object_root, size_t index) {
+        if (!collecting) {
+            return (*object_root)->fields[index].managed;
+        }
+        StellaValue field = forward((*object_root)->fields[index].managed);
+        (*object_root)->fields[index].managed = field;
+        ++counters.read_barrier_activations;
+        return field;
     }
 
     ~Heap() { delete[] arena1; delete[] arena2; }
@@ -474,7 +535,7 @@ StellaValue stella_gc_read_managed(
     stella_abi_violation("managed read index out of range");
   }
   ++counters.managed_reads;
-  return (*object_root)->fields[index].managed;
+  return heap->read(object_root, index);
 }
 
 void stella_gc_write_managed(
